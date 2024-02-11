@@ -21,3 +21,9 @@ variable "billing_account" {
   type        = string
 
 }
+
+variable "ssh_key" {
+  description = "The ssh key"
+  type        = string
+
+}
