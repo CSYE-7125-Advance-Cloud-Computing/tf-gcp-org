@@ -22,21 +22,24 @@ data "google_billing_account" "acct" {
   open            = true
 }
 
-resource "google_project" "my_project-in-a-folder" {
+resource "google_project" "kubernetes" {
   name            = "proj-${var.project_name}"
   project_id      = "proj-${var.project_name}-${substr(random_uuid.uuid.result, 0, 8)}"
   folder_id       = google_folder.dev-env.id
   billing_account = data.google_billing_account.acct.billing_account
 }
 
-# Define a map with service names and their corresponding API URLs
 variable "service_names" {
   type = map(string)
   default = {
-    "iam"           = "iam.googleapis.com"
-    "cloud-billing" = "cloudbilling.googleapis.com"
-    "compute"       = "compute.googleapis.com"
-    "container"     = "container.googleapis.com"
+    "iam"                  = "iam.googleapis.com"
+    "cloud-billing"        = "cloudbilling.googleapis.com"
+    "compute"              = "compute.googleapis.com"
+    "container"            = "container.googleapis.com"
+    "dns"                  = "dns.googleapis.com"
+    "serviceusage"         = "serviceusage.googleapis.com"
+    "vpc"                  = "vpcaccess.googleapis.com"
+    "cloudresourcemanager" = "cloudresourcemanager.googleapis.com"
   }
 }
 
@@ -44,9 +47,9 @@ variable "service_names" {
 resource "google_project_service" "services" {
   for_each = var.service_names
 
-  project                    = google_project.my_project-in-a-folder.project_id
-  service                    = each.value
-  disable_dependent_services = true
+  project = google_project.kubernetes.project_id
+  service = each.value
+  # disable_dependent_services = true
 
   timeouts {
     create = "30m"
@@ -55,12 +58,10 @@ resource "google_project_service" "services" {
 }
 
 resource "google_compute_network" "vpc_network" {
-  name                            = "vpc-network"
-  project                         = google_project.my_project-in-a-folder.project_id
-  routing_mode                    = "REGIONAL"
-  auto_create_subnetworks         = "false"
-  mtu                             = 1460
-  delete_default_routes_on_create = "true"
+  name                    = "vpc-network"
+  project                 = google_project.kubernetes.project_id
+  auto_create_subnetworks = "false"
+
 
   depends_on = [
     google_project_service.services["compute"],
@@ -68,44 +69,48 @@ resource "google_compute_network" "vpc_network" {
   ]
 }
 
+resource "google_compute_subnetwork" "public_subnet" {
+  name          = "public-subnet"
+  ip_cidr_range = cidrsubnet(var.cidr_block, 4, 1)
+  network       = google_compute_network.vpc_network.id
+  project       = google_project.kubernetes.project_id
+}
 
-resource "google_compute_subnetwork" "private" {
-  name                     = "private"
-  project                  = google_project.my_project-in-a-folder.project_id
-  ip_cidr_range            = "10.0.0.0/18"
-  region                   = "us-east1"
-  network                  = google_compute_network.vpc_network.id
+resource "google_compute_subnetwork" "private_subnet" {
+  name                     = "private-subnet"
+  ip_cidr_range            = cidrsubnet(var.cidr_block, 4, 2)
   private_ip_google_access = true
+  network                  = google_compute_network.vpc_network.id
+  project                  = google_project.kubernetes.project_id
 
   secondary_ip_range {
-    range_name    = "k8s-pods-range"
-    ip_cidr_range = "10.48.0.0/14"
+    range_name    = "k8s-pod-range"
+    ip_cidr_range = var.k8s_pod_range
   }
-
   secondary_ip_range {
-    range_name    = "k8s-services-range"
-    ip_cidr_range = "10.52.0.0/20"
+    range_name    = "k8s-service-range"
+    ip_cidr_range = var.k8s_service_range
   }
 }
 
 resource "google_compute_router" "router" {
+  project = google_project.kubernetes.project_id
   name    = "router"
-  project = google_project.my_project-in-a-folder.project_id
-  region  = "us-east1"
-  network = google_compute_network.vpc_network.id
+  region  = var.region
+  network = google_compute_network.vpc_network.name
 }
 
 resource "google_compute_router_nat" "nat" {
+  project = google_project.kubernetes.project_id
   name    = "nat"
-  project = google_project.my_project-in-a-folder.project_id
   router  = google_compute_router.router.name
-  region  = "us-east1"
+  region  = var.region
 
   source_subnetwork_ip_ranges_to_nat = "LIST_OF_SUBNETWORKS"
   nat_ip_allocate_option             = "MANUAL_ONLY"
 
   subnetwork {
-    name                    = google_compute_subnetwork.private.id
+    name                    = google_compute_subnetwork.private_subnet.id
     source_ip_ranges_to_nat = ["ALL_IP_RANGES"]
   }
 
@@ -113,228 +118,174 @@ resource "google_compute_router_nat" "nat" {
 }
 
 resource "google_compute_address" "nat" {
+  project      = google_project.kubernetes.project_id
   name         = "nat"
-  project      = google_project.my_project-in-a-folder.project_id
-  region       = "us-east1"
   address_type = "EXTERNAL"
   network_tier = "PREMIUM"
 
   depends_on = [
     google_project_service.services["compute"]
   ]
-
 }
 
 
-resource "google_compute_firewall" "allow-ssh" {
-  name = "allow-ssh"
-
-  network = google_compute_network.vpc_network.name
-  project = google_project.my_project-in-a-folder.project_id
-
+resource "google_compute_firewall" "instance_firewall" {
+  project   = google_project.kubernetes.project_id
+  name      = "instance-firewall"
+  network   = google_compute_network.vpc_network.name
+  direction = "INGRESS"
   allow {
     protocol = "tcp"
     ports    = ["22"]
   }
 
   source_ranges = ["0.0.0.0/0"]
-
+  target_tags   = ["web"]
 }
 
-# resource "google_project_organization_policy" "constraint" {
-#   project = google_project.my_project-in-a-folder.project_id
+resource "google_service_account" "bastion_host_sa" {
+  project      = google_project.kubernetes.project_id
+  account_id   = "bastion-host-sa"
+  display_name = "My Compute Instance Service Account"
+}
 
-#   constraint = "constraints/compute.vmExternalIpAccess"
+resource "google_compute_instance" "bastion_host" {
+  project                   = google_project.kubernetes.project_id
+  name                      = "bastion-host"
+  machine_type              = "e2-medium"
+  zone                      = "us-east1-b"
+  allow_stopping_for_update = true
 
-#   boolean_policy {
-#     enforced = false
-#   }
+  tags = ["web"]
 
-# }
-
-
-resource "google_compute_instance" "vm_instance" {
-  name         = "my-vm-instance"
-  project      = google_project.my_project-in-a-folder.project_id
-  machine_type = "n2-standard-2"
-  zone         = "us-east1-b"
   boot_disk {
     initialize_params {
-      image = "debian-cloud/debian-11"
+      image = "debian-cloud/debian-12"
+      labels = {
+        my_label = "value"
+      }
     }
   }
 
   network_interface {
-    subnetwork = google_compute_subnetwork.private.id
+    subnetwork = google_compute_subnetwork.public_subnet.self_link
     access_config {
-      // Include this block if you want to give the VM a public IP
+      // To allow external IP access
     }
   }
 
+  service_account {
+    email  = google_service_account.bastion_host_sa.email
+    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+  }
+
   metadata = {
-    ssh-keys = "${var.ssh_key}"
+    ssh-keys = "${var.ssh_username}:${file(var.ssh_key_path)}"
   }
 
   depends_on = [
-    google_compute_subnetwork.private
+    google_compute_subnetwork.private_subnet,
   ]
+
+  metadata_startup_script = file("${path.module}/startup_script.sh")
+
 }
 
-resource "google_container_cluster" "gke-cluster" {
-  name                     = "gke-cluster"
-  project                  = google_project.my_project-in-a-folder.project_id
-  location                 = "us-east1"
+resource "google_service_account" "gke_sa" {
+  project      = google_project.kubernetes.project_id
+  account_id   = format("gke-sa")
+  display_name = "gke-sa"
+}
+
+resource "google_container_cluster" "my_cluster" {
+  project                  = google_project.kubernetes.project_id
+  name                     = "my-gke-cluster"
+  location                 = var.region
+  network                  = google_compute_network.vpc_network.self_link
+  subnetwork               = google_compute_subnetwork.private_subnet.self_link
   remove_default_node_pool = true
   initial_node_count       = 1
-  network                  = google_compute_network.vpc_network.name
-  subnetwork               = google_compute_subnetwork.private.name
-  logging_service          = "logging.googleapis.com/kubernetes"
-  monitoring_service       = "monitoring.googleapis.com/kubernetes"
-  networking_mode          = "VPC_NATIVE"
-
-  release_channel {
-    channel = "REGULAR"
-  }
-
-  deletion_protection = false
 
   node_config {
-    machine_type = "e2-medium"
-    image_type   = "COS_CONTAINERD"
+    service_account = google_service_account.gke_sa.email
+    disk_type       = "pd-standard"
+    oauth_scopes = [
+      "https://www.googleapis.com/auth/cloud-platform"
+    ]
+  }
+
+  private_cluster_config {
+    enable_private_nodes    = true
+    enable_private_endpoint = false
+    master_ipv4_cidr_block  = var.master_ipv4_cidr_block
+  }
+
+  ip_allocation_policy {
+    cluster_secondary_range_name  = "k8s-pod-range"
+    services_secondary_range_name = "k8s-service-range"
   }
 
   workload_identity_config {
-    workload_pool = "${google_project.my_project-in-a-folder.project_id}.svc.id.goog"
+    workload_pool = "${google_project.kubernetes.project_id}.svc.id.goog"
   }
-
 
   binary_authorization {
     evaluation_mode = "PROJECT_SINGLETON_POLICY_ENFORCE"
   }
 
-  node_locations = [
-    "us-east1-b",
-    "us-east1-c",
-    "us-east1-d"
-  ]
-
-  addons_config {
-    http_load_balancing {
-      disabled = true
+  master_authorized_networks_config {
+    cidr_blocks {
+      cidr_block   = "${google_compute_instance.bastion_host.network_interface[0].access_config[0].nat_ip}/32"
+      display_name = "Bastion Host access to cluster"
     }
-
-    horizontal_pod_autoscaling {
-      disabled = false
+    cidr_blocks {
+      cidr_block   = var.jenkins_cidr_block
+      display_name = "Jenkins Server access to cluster"
     }
   }
+  deletion_protection = false
+}
 
-  ip_allocation_policy {
-    cluster_secondary_range_name  = "k8s-pods-range"
-    services_secondary_range_name = "k8s-services-range"
+resource "google_container_node_pool" "primary_preemptible_nodes" {
+  project    = google_project.kubernetes.project_id
+  name       = "my-node-pool"
+  location   = var.region
+  cluster    = google_container_cluster.my_cluster.name
+  node_count = 1
+  autoscaling {
+
+    total_min_node_count = var.min_node_count
+    total_max_node_count = var.max_node_count
+    # location_policy = "BALANCED"
   }
 
-  private_cluster_config {
-    enable_private_endpoint = false
-    enable_private_nodes    = true
-    master_ipv4_cidr_block  = "172.16.0.0/28"
+  node_config {
+    machine_type = var.node_machine_type
+    image_type   = "COS_CONTAINERD"
+    disk_type    = "pd-standard"
+    labels = {
+      team = "gke"
+    }
+    service_account = google_service_account.gke_sa.email
+    oauth_scopes = [
+      "https://www.googleapis.com/auth/cloud-platform"
+    ]
   }
 }
 
+# resource "null_resource" "run_last" {
+#   depends_on = [google_container_node_pool.primary_preemptible_nodes]
 
-resource "google_service_account" "kubernetes" {
-  account_id = "kubernetes"
-  project    = google_project.my_project-in-a-folder.project_id
-
-}
-
-# resource "google_container_node_pool" "general" {
-#   name       = "general"
-#   project    = google_project.my_project-in-a-folder.project_id
-#   cluster    = google_container_cluster.primary.id
-#   node_count = 1
-
-#   management {
-#     auto_repair  = true
-#     auto_upgrade = true
-#   }
-
-#   node_config {
-#     preemptible  = false
-#     machine_type = "e2-small"
-
-#     labels = {
-#       role = "general"
+#   provisioner "remote-exec" {
+#     connection {
+#       type        = "ssh"
+#       user        = var.ssh_username
+#       agent       = false
+#       private_key = file(var.ssh_private_key)
+#       host        = google_compute_instance.bastion_host.network_interface[0].access_config[0].nat_ip
 #     }
-
-#     service_account = google_service_account.kubernetes.email
-#     oauth_scopes = [
-#       "https://www.googleapis.com/auth/cloud-platform",
-#     ]
-
-#   }
-
-# }
-
-
-# resource "google_container_node_pool" "spot" {
-#   name       = "spot"
-#   project    = google_project.my_project-in-a-folder.project_id
-#   cluster    = google_container_cluster.primary.id
-#   node_count = 1
-
-#   management {
-#     auto_repair  = true
-#     auto_upgrade = true
-#   }
-
-#   autoscaling {
-#     min_node_count = 0
-#     max_node_count = 10
-#   }
-
-#   node_config {
-#     preemptible  = true
-#     machine_type = "e2-small"
-
-#     labels = {
-#       team = "devops"
-#     }
-
-#     taint {
-#       key    = "special"
-#       value  = "spot"
-#       effect = "NO_SCHEDULE"
-#     }
-
-#     service_account = google_service_account.kubernetes.email
-#     oauth_scopes = [
-#       "https://www.googleapis.com/auth/cloud-platform",
+#     inline = [
+#       "gcloud container clusters get-credentials '${google_container_cluster.my_cluster.name}' --region '${google_container_cluster.my_cluster.location}' --project ${google_project.kubernetes.project_id}"
 #     ]
 #   }
-
 # }
-
-resource "google_compute_instance" "bastion_host" {
-  name                      = "bastion-host"
-  project                   = google_project.my_project-in-a-folder.project_id
-  machine_type              = "e2-medium"
-  zone                      = "us-east1-b"
-  allow_stopping_for_update = true
-
-  boot_disk {
-    initialize_params {
-      image = "debian-cloud/debian-11"
-    }
-  }
-
-  network_interface {
-    subnetwork = google_compute_subnetwork.private.id
-    access_config {
-      // Include this block to give the instance a public IP
-    }
-  }
-
-  metadata = {
-    ssh-keys = "${var.ssh_key}"
-  }
-}
